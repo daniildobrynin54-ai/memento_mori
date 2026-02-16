@@ -2,11 +2,12 @@
 
 import logging
 import asyncio
+import re
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ConversationHandler, ContextTypes
 
 from config import TELEGRAM_BOT_TOKEN, LOGIN_EMAIL, LOGIN_PASSWORD, REQUIRED_TG_GROUP_ID
-from database import init_db
+from database import init_db, get_bookings_for_schedule
 from auth import login
 from proxy_manager import ProxyManager
 from rank_detector import RankDetectorImproved
@@ -17,6 +18,9 @@ from booking_handler import BOOKING_TRIGGER, booking_trigger_handler, get_confir
 from booking_scheduler import init_scheduler
 from handlers import register_user_handlers
 from admin_handlers import register_admin_handlers
+from group_booking import show_booking_menu, register_group_booking_handlers
+from schedule_view import format_schedule
+from timezone_utils import get_today_date, get_tomorrow_date
 
 # Настройка логирования
 logging.basicConfig(
@@ -29,6 +33,12 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+# Regex для триггера "брони"
+SCHEDULE_TRIGGER = re.compile(
+    r'\b(брони|расписание|schedule)\b',
+    re.IGNORECASE
+)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -52,7 +62,7 @@ async def log_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"   Текст: {text}"
         )
         
-        # Проверяем триггер
+        # Проверяем триггер бронирования
         if BOOKING_TRIGGER.search(text or ""):
             logger.info(f"   ✅ Триггер бронирования обнаружен!")
             
@@ -66,6 +76,29 @@ async def log_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"      Текущий: {chat_id}\n"
                         f"      Ожидается: {REQUIRED_TG_GROUP_ID}"
                     )
+        
+        # Проверяем триггер расписания
+        if SCHEDULE_TRIGGER.search(text or ""):
+            logger.info(f"   ✅ Триггер расписания обнаружен!")
+
+
+# ══════════════════════════════════════════════════════════════
+# ОБРАБОТЧИК ТРИГГЕРА "БРОНИ"
+# ══════════════════════════════════════════════════════════════
+
+
+async def handle_schedule_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает расписание броней при упоминании слова 'брони'."""
+    logger.info("🔔 Триггер расписания обнаружен!")
+    
+    today = get_today_date()
+    tomorrow = get_tomorrow_date()
+    
+    bookings = await get_bookings_for_schedule([today, tomorrow])
+    text = format_schedule(bookings, [today, tomorrow])
+    
+    await update.message.reply_text(text)
+    logger.info("✅ Расписание отправлено")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -172,32 +205,34 @@ async def main():
     )
     application.add_handler(booking_conv_private, group=0)
     
-    # 5. ОТДЕЛЬНЫЙ ОБРАБОТЧИК ДЛЯ ГРУПП - без ConversationHandler
-    async def handle_group_booking_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработчик триггера бронирования в группах."""
-        logger.info("🔔 Триггер бронирования в группе обнаружен!")
-        
-        # Отправляем сообщение с инструкцией
-        await update.message.reply_text(
-            "📅 Для бронирования напиши мне в личные сообщения:\n"
-            f"👉 @{context.bot.username}\n\n"
-            "Или нажми /start и следуй инструкциям."
-        )
-        
-        logger.info("✅ Ответ в группу отправлен")
-    
+    # 5. БРОНИРОВАНИЕ В ГРУППАХ через inline-кнопки
     application.add_handler(
         MessageHandler(
             filters.TEXT & 
             filters.Regex(BOOKING_TRIGGER) & 
             (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP) &  # ТОЛЬКО группы
             ~filters.COMMAND,
-            handle_group_booking_trigger
+            show_booking_menu
         ),
-        group=0  # Тот же приоритет, что и ConversationHandler
+        group=0
     )
     
-    # 6. Callback для подтверждения брони
+    # 6. ПОКАЗ РАСПИСАНИЯ по триггеру "брони"
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & 
+            filters.Regex(SCHEDULE_TRIGGER) & 
+            (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP) &  # ТОЛЬКО группы
+            ~filters.COMMAND,
+            handle_schedule_trigger
+        ),
+        group=0
+    )
+    
+    # 7. Callback handlers для группового бронирования
+    register_group_booking_handlers(application)
+    
+    # 8. Callback для подтверждения брони
     application.add_handler(get_confirm_booking_handler())
     
     logger.info("✅ Обработчики зарегистрированы")
@@ -231,6 +266,11 @@ async def main():
 
     logger.info("=" * 60)
     logger.info("✅ ВСЕ СИСТЕМЫ ЗАПУЩЕНЫ")
+    logger.info("=" * 60)
+    logger.info("")
+    logger.info("📋 ДОСТУПНЫЕ ТРИГГЕРЫ В ГРУППАХ:")
+    logger.info("   • 'бронь' / 'забронировать' - открыть меню бронирования")
+    logger.info("   • 'брони' / 'расписание' - показать расписание на сегодня/завтра")
     logger.info("=" * 60)
 
     try:
