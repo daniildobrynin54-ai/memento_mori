@@ -1,19 +1,19 @@
 """Модуль уведомлений."""
 
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import TelegramError
 
-from config import BASE_URL, CLUB_BOOST_PATH, REQUIRED_TG_GROUP_ID
+from config import BASE_URL, CLUB_BOOST_PATH, REQUIRED_TG_GROUP_ID, GROUP_CARD_TOPIC_ID
 from database import get_user_by_mangabuff_id, Booking
-from timezone_utils import format_date_ru, format_time_range
+from timezone_utils import format_date_ru, format_time_range, now_msk
 
 logger = logging.getLogger(__name__)
 
 
 # ══════════════════════════════════════════════════════════════
-# УВЕДОМЛЕНИЯ О КАРТАХ
+# УВЕДОМЛЕНИЯ О КАРТАХ — ЛИЧНЫЕ СООБЩЕНИЯ ВЛАДЕЛЬЦАМ
 # ══════════════════════════════════════════════════════════════
 
 
@@ -107,6 +107,135 @@ async def send_card_notification(
     except TelegramError as e:
         logger.error(f"Ошибка отправки уведомления пользователю {mangabuff_id}: {e}")
         return False
+
+
+# ══════════════════════════════════════════════════════════════
+# УВЕДОМЛЕНИЕ О НОВОЙ КАРТЕ В ТОПИК ГРУППЫ
+# ══════════════════════════════════════════════════════════════
+
+
+async def notify_group_new_card(
+    bot: Bot,
+    card_data: Dict[str, Any],
+    card_name: str,
+    owners_nicks: List[Tuple[int, str]]
+) -> bool:
+    """
+    Отправляет уведомление о новой карте клуба в топик группы.
+
+    Формат сообщения:
+    1. Картинка
+    2. Имя карты
+    3. Ранг
+    4. Какая по счёту карта вложена сегодня
+    5. Кто из участников клуба имеет эту карту
+    6. Ссылка на страницу вклада
+    7. Время вклада
+
+    Args:
+        bot: экземпляр Telegram бота
+        card_data: данные карты (card_id, card_rank, card_image_url,
+                   replacements, daily_donated, club_owners, discovered_at)
+        card_name: название карты (получено с /cards/{id}/users)
+        owners_nicks: список (user_id, nickname) владельцев карты в клубе
+
+    Returns:
+        True если успешно отправлено
+    """
+    try:
+        card_id = card_data.get("card_id", "?")
+        card_rank = card_data.get("card_rank", "?")
+        replacements = card_data.get("replacements", "?")
+        daily_donated = card_data.get("daily_donated", "?")
+        card_image_url = card_data.get("card_image_url", "")
+
+        # Парсим счётчик "какая по счёту" из daily_donated (формат "X/Y")
+        donated_count = _parse_first_number(daily_donated)
+        donated_ordinal = _make_ordinal(donated_count) if donated_count else daily_donated
+
+        # Время вклада (МСК)
+        now = now_msk()
+        time_str = now.strftime("%H:%M МСК")
+        date_str = now.strftime("%d.%m.%Y")
+
+        # Блок с владельцами
+        if owners_nicks:
+            owners_lines = "\n".join(
+                f"  • <a href=\"{BASE_URL}/users/{uid}\">{nick}</a>"
+                for uid, nick in owners_nicks
+            )
+            owners_block = f"👥 <b>Есть у участников клуба:</b>\n{owners_lines}"
+        else:
+            owners_block = "👥 <b>Владельцев в клубе нет</b>"
+
+        # Ссылка на страницу вклада
+        boost_url = f"{BASE_URL}{CLUB_BOOST_PATH}"
+        card_url = f"{BASE_URL}/cards/{card_id}/users"
+
+        text = (
+            f"🃏 <b>{card_name}</b>\n"
+            f"⭐ Ранг: <b>{card_rank}</b>\n\n"
+            f"📊Вкладов сегодня: {daily_donated}\n"
+            f"{owners_block}\n\n"
+            f"🔗 <a href=\"{boost_url}\">Внести карту в клуб</a>\n"
+            f"⏰ {date_str} {time_str}"
+        )
+
+        # Отправляем в топик группы
+        send_kwargs = {
+            "chat_id": REQUIRED_TG_GROUP_ID,
+            "parse_mode": "HTML",
+            "message_thread_id": GROUP_CARD_TOPIC_ID,
+        }
+
+        if card_image_url:
+            await bot.send_photo(
+                photo=card_image_url,
+                caption=text,
+                **send_kwargs
+            )
+        else:
+            await bot.send_message(
+                text=text,
+                **send_kwargs
+            )
+
+        logger.info(
+            f"✅ Уведомление о карте #{card_id} «{card_name}» "
+            f"отправлено в топик {GROUP_CARD_TOPIC_ID}"
+        )
+        return True
+
+    except TelegramError as e:
+        logger.error(f"Ошибка отправки уведомления о карте в группу: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Непредвиденная ошибка в notify_group_new_card: {e}", exc_info=True)
+        return False
+
+
+def _parse_first_number(value: str) -> int:
+    """Извлекает первое число из строки формата 'X/Y'."""
+    try:
+        return int(str(value).split("/")[0].strip())
+    except (ValueError, IndexError):
+        return 0
+
+
+def _make_ordinal(n: int) -> str:
+    """Возвращает порядковое числительное на русском: 1-я, 2-я, 3-я..."""
+    if n <= 0:
+        return "?"
+    # Исключения для 11, 12, 13, 14
+    if 11 <= (n % 100) <= 14:
+        return f"{n}-я"
+    last = n % 10
+    if last == 1:
+        return f"{n}-я"
+    elif last in (2, 3, 4):
+        return f"{n}-я"
+    else:
+        return f"{n}-я"
 
 
 # ══════════════════════════════════════════════════════════════

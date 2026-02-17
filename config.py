@@ -54,6 +54,11 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_TG_ID = int(os.getenv("ADMIN_TG_ID", "0"))
 REQUIRED_TG_GROUP_ID = int(os.getenv("REQUIRED_TG_GROUP_ID", "0"))
 
+# ID топика (темы) в группе для уведомлений о новых картах клуба
+# Ссылка на топик: https://t.me/c/2477784115/128484
+# Chat ID для API: -1002477784115 (нужно добавить -100 к числу из ссылки)
+GROUP_CARD_TOPIC_ID = int(os.getenv("GROUP_CARD_TOPIC_ID", "128484"))
+
 # ══════════════════════════════════════════════════════════════
 # ЧАСОВОЙ ПОЯС
 # ══════════════════════════════════════════════════════════════

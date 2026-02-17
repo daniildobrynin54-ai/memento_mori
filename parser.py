@@ -71,18 +71,11 @@ class BoostPageParser:
                 "discovered_at": ts_for_db(now_msk())
             }
             
-        except (requests.exceptions.ProxyError, 
+        except (requests.exceptions.ProxyError,
                 requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout) as e:
             self._mark_error()
             logger.error(f"Ошибка сети при парсинге: {type(e).__name__}")
-            
-            # При проблемах с прокси - ротация
-            if hasattr(self.session, '_session') and hasattr(self.session._session, 'proxies'):
-                # Это RateLimitedSession с прокси
-                from proxy_manager import ProxyManager
-                # Уведомляем прокси-менеджер об ошибке через главный цикл
-                
             return None
             
         except Exception as e:
@@ -119,7 +112,6 @@ class BoostPageParser:
         if img:
             src = img.get("src", "")
             if src:
-                # Если относительный URL, делаем абсолютным
                 if src.startswith("/"):
                     return f"{BASE_URL}{src}"
                 return src
@@ -127,7 +119,6 @@ class BoostPageParser:
     
     def _extract_replacements(self, soup: BeautifulSoup) -> str:
         """Извлекает информацию о заменах (7/10)."""
-        # Ищем паттерн "X / Y" где X - текущие замены, Y - лимит
         text = soup.get_text()
         match = re.search(r'(\d+)\s*/\s*(\d+)', text)
         if match:
@@ -136,12 +127,9 @@ class BoostPageParser:
     
     def _extract_daily_donated(self, soup: BeautifulSoup) -> str:
         """Извлекает информацию о вложениях (82/50)."""
-        # Ищем текст с вложениями
         text = soup.get_text()
-        # Паттерн для поиска вложений (обычно больше число)
         matches = re.findall(r'(\d+)\s*/\s*(\d+)', text)
         if len(matches) >= 2:
-            # Берём второе совпадение (первое - замены)
             return f"{matches[1][0]}/{matches[1][1]}"
         return "0/50"
     
@@ -149,7 +137,6 @@ class BoostPageParser:
         """Извлекает список ID владельцев карты из клуба."""
         owner_ids = []
         
-        # Ищем все ссылки на пользователей в блоке владельцев
         owners_block = soup.select_one('.club-boost__owners-list')
         if owners_block:
             links = owners_block.select('a[href*="/users/"]')
@@ -172,7 +159,8 @@ async def parse_loop(session: requests.Session, bot, rank_detector: RankDetector
         rank_detector: детектор рангов
     """
     from database import get_current_card, archive_card, insert_card
-    from notifier import notify_owners
+    from notifier import notify_owners, notify_group_new_card
+    from card_info_parser import get_card_name, get_owners_nicknames
     
     parser = BoostPageParser(session, rank_detector)
     logger.info("🔄 Запущен цикл парсинга страницы boost")
@@ -211,14 +199,49 @@ async def parse_loop(session: requests.Session, bot, rank_detector: RankDetector
                     if current:
                         await archive_card(current.id)
                     
-                    # Добавляем новую карту
+                    # Добавляем новую карту в БД
                     await insert_card(data)
                     
-                    # Отправляем уведомления
+                    # ──────────────────────────────────────────────
+                    # Получаем дополнительные данные для группового
+                    # уведомления (в executor, т.к. синхронные запросы)
+                    # ──────────────────────────────────────────────
+                    loop = asyncio.get_event_loop()
+
+                    # 1. Название карты
+                    card_name = await loop.run_in_executor(
+                        None,
+                        get_card_name,
+                        session,
+                        data["card_id"]
+                    )
+
+                    # 2. Ники владельцев карты в клубе
+                    owners_nicks = []
+                    if data["club_owners"]:
+                        owners_nicks = await loop.run_in_executor(
+                            None,
+                            get_owners_nicknames,
+                            session,
+                            data["club_owners"],
+                            10  # не более 10 владельцев
+                        )
+
+                    # 3. Уведомляем владельцев в личку
                     await notify_owners(bot, data)
+
+                    # 4. Уведомляем группу в топик
+                    await notify_group_new_card(
+                        bot,
+                        data,
+                        card_name,
+                        owners_nicks
+                    )
                     
                     logger.info(
-                        f"✅ Новая карта ID {data['card_id']} (Ранг: {data['card_rank']})"
+                        f"✅ Новая карта «{card_name}» "
+                        f"ID {data['card_id']} (Ранг: {data['card_rank']}), "
+                        f"владельцев: {len(owners_nicks)}"
                     )
             else:
                 consecutive_failures += 1
@@ -230,12 +253,7 @@ async def parse_loop(session: requests.Session, bot, rank_detector: RankDetector
                         f"пытаемся сменить прокси"
                     )
                     
-                    # Если используется RateLimitedSession с прокси
                     if hasattr(session, '_session'):
-                        from auth import create_session
-                        from config import LOGIN_EMAIL, LOGIN_PASSWORD
-                        
-                        # Пытаемся получить прокси-менеджер из bot_data
                         try:
                             proxy_manager = bot._application.bot_data.get("proxy_manager")
                             if proxy_manager:
