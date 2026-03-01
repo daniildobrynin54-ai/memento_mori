@@ -262,51 +262,52 @@ async def clear_pinned_alliance_message(chat_id: int):
 # ══════════════════════════════════════════════════════════════
 
 
-def format_alliance_weekly_message(rows: List[Dict], week_start: str) -> str:
+def format_alliance_weekly_message(rows: list, week_start: str) -> str:
     """
-    Формат: одна строка на участника, медали для топ-3, пустая строка
-    между медалистами и остальными для читаемости.
-
-    Пример:
-    🥇 SweetDreams — 91520 → 91553 (+33)
-    🥈 Ака17 — 25785 → 25785 (+0)
-    🥉 Жрец смерти — 9147 → 9147 (+0)
-
-    4. NedocheloveK — 8627 → 8627 (+0)
-    5. Валерий Г — 5465 → 5465 (+0)
+    Показывает только тех, кто реально вкладывал за неделю (delta > 0),
+    отсортированных по приросту по убыванию.
     """
+    from alliance_weekly_stats import format_alliance_week_range
+    from timezone_utils import now_msk
+
     date_range = format_alliance_week_range(week_start)
 
-    if not rows:
+    # Фильтруем: только те, у кого прирост > 0
+    active_rows = [r for r in rows if r["contribution_current"] - r["contribution_baseline"] > 0]
+
+    # Сортируем по приросту по убыванию
+    active_rows.sort(key=lambda r: r["contribution_current"] - r["contribution_baseline"], reverse=True)
+
+    total_delta = sum(r["contribution_current"] - r["contribution_baseline"] for r in rows)
+    updated = now_msk().strftime("%d.%m %H:%M МСК")
+
+    if not active_rows:
         return (
             f"🏰 <b>Вклад клуба в альянс</b> ({date_range})\n\n"
-            "Данных пока нет."
+            f"За эту неделю вкладов ещё не было.\n\n"
+            f"📈 Прирост: <b>+{total_delta}</b>\n"
+            f"🕐 <i>Обновлено: {updated}</i>"
         )
 
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     medal_lines = []
-    rest_lines  = []
+    rest_lines = []
 
-    for i, r in enumerate(rows, 1):
-        url       = r.get("profile_url", "")
-        nick      = r["nick"]
-        base      = r["contribution_baseline"]
-        curr      = r["contribution_current"]
-        delta     = curr - base
-        delta_str = f"+{delta}" if delta >= 0 else str(delta)
+    for i, r in enumerate(active_rows, 1):
+        url = r.get("profile_url", "")
+        nick = r["nick"]
+        base = r["contribution_baseline"]
+        curr = r["contribution_current"]
+        delta = curr - base
         name_part = f'<a href="{url}">{nick}</a>' if url else nick
 
-        line = f"{medals[i] if i in medals else f'{i}.'} {name_part} — {base} → <b>{curr}</b> ({delta_str})"
+        line = f"{medals.get(i, f'{i}.')} {name_part} — {base} → <b>{curr}</b> (+{delta})"
 
         if i <= 3:
             medal_lines.append(line)
         else:
             rest_lines.append(line)
 
-    updated     = now_msk().strftime("%d.%m %H:%M МСК")
-    total_delta = sum(r["contribution_current"] - r["contribution_baseline"] for r in rows)
-
-    # Медалисты отделены пустой строкой от остальных
     body = "\n".join(medal_lines)
     if rest_lines:
         body += "\n\n" + "\n".join(rest_lines)
@@ -314,7 +315,7 @@ def format_alliance_weekly_message(rows: List[Dict], week_start: str) -> str:
     return (
         f"🏰 <b>Вклад клуба в альянс</b> ({date_range})\n\n"
         + body
-        + f"\n\n📈 Прирост за неделю: <b>+{total_delta}</b>"
+        + f"\n📈 Прирост за неделю: <b>+{total_delta}</b>"
         + f"\n🕐 <i>Обновлено: {updated}</i>"
     )
 

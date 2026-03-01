@@ -44,7 +44,7 @@ ALLIANCE_URL = os.getenv(
     f"https://mangabuff.ru/alliances/{_ALLIANCE_ID}/boost"
 )
 # Интервал проверки альянса в секундах
-ALLIANCE_CHECK_INTERVAL = int(os.getenv("ALLIANCE_CHECK_INTERVAL", "1"))
+ALLIANCE_CHECK_INTERVAL = int(os.getenv("ALLIANCE_CHECK_INTERVAL", "60"))
 
 # ══════════════════════════════════════════════════════════════
 # TELEGRAM
