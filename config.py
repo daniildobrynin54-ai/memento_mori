@@ -2,10 +2,12 @@
 
 import os
 import pytz
+from pathlib import Path
 from dotenv import load_dotenv
 
-# Загружаем переменные окружения
-load_dotenv()
+# Загружаем .env из директории самого config.py
+_env_path = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=_env_path)
 
 # ══════════════════════════════════════════════════════════════
 # САЙТ

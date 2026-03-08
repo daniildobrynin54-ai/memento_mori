@@ -156,33 +156,20 @@ def login(
     xsrf = unquote(xsrf_raw) if xsrf_raw else csrf
 
     # ------------------------------------------------------------------
-    # Шаг 3: POST /login как AJAX (XHR)
-    #
-    # Форма на сайте — это <div class="form">, не <form>.
-    # Кнопка "Войти" (.login-button) обрабатывается JS-ом через fetch/XHR.
-    # Сервер ожидает AJAX-запрос, не обычный form submit.
+    # Шаг 3: POST /login
     # ------------------------------------------------------------------
-    ajax_headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "X-Requested-With": "XMLHttpRequest",
-        "X-CSRF-TOKEN": xsrf,
-        "X-XSRF-TOKEN": xsrf,
-        "Origin": BASE_URL,
+    post_headers = {
         "Referer": f"{BASE_URL}/login",
-        "Sec-Ch-Ua": '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
+        "Origin": BASE_URL,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-CSRF-TOKEN": csrf,
     }
 
     try:
         r_post = raw.post(
             f"{BASE_URL}/login",
-            data={"login": email, "password": password, "_token": csrf},
-            headers=ajax_headers,
+            data={"email": email, "password": password, "_token": csrf},
+            headers=post_headers,
             allow_redirects=True,
             timeout=REQUEST_TIMEOUT,
         )
@@ -191,87 +178,24 @@ def login(
         return None
 
     print(f"   [3] POST /login → статус {r_post.status_code}, URL: {r_post.url}")
-    print(f"   Content-Type ответа: {r_post.headers.get('content-type', '?')}")
 
     # ------------------------------------------------------------------
-    # Шаг 4: разбираем ответ
+    # Шаг 4: проверяем наличие куки сессии
     # ------------------------------------------------------------------
-    ct = r_post.headers.get("content-type", "")
-
-    if "application/json" in ct:
-        try:
-            j = r_post.json()
-            print(f"   JSON ответ: {j}")
-        except Exception:
-            print(f"   JSON parse error, body: {r_post.text[:200]}")
-            return None
-
-        # Проверяем признаки неудачи
-        if j.get("errors") or j.get("message") == "Unauthenticated." or j.get("status") == "error":
-            print(f"   ❌ Сервер вернул ошибку: {j}")
-            return None
-    else:
-        # HTML ответ
-        print(f"   Не JSON ответ, body (500): {r_post.text[:500]}")
-
-    # ------------------------------------------------------------------
-    # Шаг 5: проверяем что сессия авторизована
-    # GET на закрытую страницу — должен вернуть 200, не 401
-    # ------------------------------------------------------------------
-    try:
-        r_check = raw.get(
-            f"{BASE_URL}/users/{email.split('@')[0]}",  # не важно что — нам нужен /api/user или профиль
-            timeout=REQUEST_TIMEOUT,
-        )
-    except Exception:
-        r_check = None
-
-    # Более надёжная проверка — GET на API endpoint
-    try:
-        r_check2 = raw.get(
-            f"{BASE_URL}/api/user",
-            headers={"Accept": "application/json", "X-Requested-With": "XMLHttpRequest"},
-            timeout=REQUEST_TIMEOUT,
-        )
-        print(f"   GET /api/user → {r_check2.status_code}: {r_check2.text[:200]}")
-        if r_check2.status_code == 200:
-            print("   ✅ /api/user вернул 200 — авторизованы!")
-    except Exception as e:
-        print(f"   GET /api/user → ошибка: {e}")
-
-    # Проверяем window.isAuth в HTML любой страницы
-    try:
-        r_main = raw.get(BASE_URL, timeout=REQUEST_TIMEOUT)
-        if "window.isAuth = 1" in r_main.text or 'window.isAuth=1' in r_main.text:
-            print("   ✅ window.isAuth=1 — авторизованы!")
-            is_auth = True
-        else:
-            # Ищем user_id
-            import re
-            m = re.search(r'window\.user_id\s*=\s*(\d+)', r_main.text)
-            uid = m.group(1) if m else "0"
-            print(f"   window.user_id={uid}, isAuth={'1' if 'isAuth = 1' in r_main.text else '0'}")
-            is_auth = uid != "0" and uid != ""
-    except Exception as e:
-        print(f"   Проверка isAuth → ошибка: {e}")
-        is_auth = False
-
-    if not is_auth:
-        print("   ❌ Не авторизованы после POST /login")
+    if "mangabuff_session" not in raw.cookies:
+        print("   ❌ Авторизация не удалась: нет cookie сессии")
         print(f"   Куки: {[(c.name, c.value[:25]) for c in raw.cookies]}")
         return None
 
     # ------------------------------------------------------------------
-    # Шаг 6: финальные токены для AJAX
+    # Шаг 5: финальные токены для AJAX
     # ------------------------------------------------------------------
-    _apply_ajax_tokens(raw)
-    new_csrf = _extract_csrf(r_post.text if "text/html" in ct else r_main.text)
-    if new_csrf:
-        raw.headers.update({"X-CSRF-TOKEN": new_csrf})
+    raw.headers.update({
+        "X-CSRF-TOKEN": csrf,
+        "X-Requested-With": "XMLHttpRequest",
+    })
 
-    raw.headers.update({"X-Requested-With": "XMLHttpRequest"})
-
-    print(f"   Итог: CSRF=✓, XSRF=✓, Session=✓")
+    print(f"   Итог: CSRF=✓, Session=✓")
     return session
 
 
