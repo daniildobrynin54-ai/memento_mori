@@ -212,7 +212,7 @@ async def handle_end_time_selection(update: Update, context: ContextTypes.DEFAUL
 
     await query.edit_message_text(
         f"✅ Бронь успешно создана!\n\n"
-        f"🃏 Назначение: внос карт в клуб Таро\n"
+        f"🃏 Назначение: внос карт в клуб\n"
         f"📅 Дата: {format_date_ru(date)}\n"
         f"🕐 Время: {start_time} — {end_time} МСК\n"
         f"⏱ Длительность: {format_duration(duration_hours)}\n"

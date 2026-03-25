@@ -77,6 +77,19 @@ async def ensure_weekly_tables():
                 updated_at  TEXT NOT NULL
             )
         """)
+        # ── Архив завершённых недель ─────────────────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS weekly_contributions_archive (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                week_start          TEXT NOT NULL UNIQUE,
+                week_end            TEXT NOT NULL,
+                message_text        TEXT NOT NULL,
+                total_contributions INTEGER NOT NULL DEFAULT 0,
+                participants_count  INTEGER NOT NULL DEFAULT 0,
+                archived_at         TEXT NOT NULL,
+                tg_message_id       INTEGER
+            )
+        """)
         await db.commit()
 
 
@@ -86,7 +99,7 @@ async def ensure_weekly_tables():
 
 
 def parse_weekly_contributions(html: str) -> List[Dict]:
-    soup = BeautifulSoup(html, "html.parser")
+    soup  = BeautifulSoup(html, "html.parser")
     items = soup.select(".club-boost__top-item")
     if not items:
         logger.warning("Не найдены .club-boost__top-item в ответе недельной статистики")
@@ -107,10 +120,9 @@ def parse_weekly_contributions(html: str) -> List[Dict]:
         nick = name_link.text.strip()
         href = name_link.get("href", "")
 
-        match = re.search(r"/users/(\d+)", href)
+        match        = re.search(r"/users/(\d+)", href)
         mangabuff_id = int(match.group(1)) if match else 0
-
-        profile_url = f"{BASE_URL}{href}" if href.startswith("/") else href
+        profile_url  = f"{BASE_URL}{href}" if href.startswith("/") else href
 
         contrib_el = item.select_one(".club-boost__top-contribution")
         try:
@@ -196,6 +208,117 @@ async def get_available_weeks() -> List[str]:
 
 
 # ══════════════════════════════════════════════════════════════
+# АРХИВ НЕДЕЛЬ
+# ══════════════════════════════════════════════════════════════
+
+
+async def archive_weekly_stats(week_start: str, contributions: List[Dict]) -> Optional[str]:
+    """
+    Сохраняет итоги недельной статистики вкладов в архив.
+    Возвращает текст итогового сообщения или None если нечего архивировать.
+    """
+    await ensure_weekly_tables()
+
+    if not contributions:
+        logger.info(f"[Weekly archive] Неделя {week_start}: нет данных, пропускаем")
+        return None
+
+    week_end   = get_week_end(week_start)
+    date_range = format_week_range(week_start)
+    total      = sum(c["contribution"] for c in contributions)
+    medals     = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+    lines = [f"🏆 <b>Итоги вкладов в клуб</b> ({date_range})\n"]
+    for i, c in enumerate(contributions, 1):
+        prefix    = medals.get(i, f"<b>{i}.</b>")
+        url       = c.get("profile_url", "")
+        nick      = c["nick"]
+        count     = c["contribution"]
+        word      = _plural_contribution(count)
+        name_part = f'<a href="{url}">{nick}</a>' if url else nick
+        lines.append(f"{prefix} {name_part} — {count} {word}")
+
+    lines.append(f"\n👥 Участников: {len(contributions)}")
+    lines.append(f"🔢 Всего вкладов: <b>{total}</b>")
+    lines.append(f"\n📦 Данные сохранены в архив.")
+
+    text = "\n".join(lines)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO weekly_contributions_archive
+                (week_start, week_end, message_text,
+                 total_contributions, participants_count, archived_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(week_start) DO UPDATE SET
+                message_text        = excluded.message_text,
+                total_contributions = excluded.total_contributions,
+                participants_count  = excluded.participants_count,
+                archived_at         = excluded.archived_at
+        """, (
+            week_start, week_end, text,
+            total, len(contributions), ts_for_db(now_msk()),
+        ))
+        await db.commit()
+
+    logger.info(
+        f"[Weekly archive] Неделя {week_start} сохранена: "
+        f"{len(contributions)} участников, {total} вкладов"
+    )
+    return text
+
+
+async def send_weekly_archive_message(
+    bot: Bot,
+    week_start: str,
+    contributions: List[Dict],
+) -> bool:
+    """
+    Отправляет итоговое сообщение недели в топик и сохраняет в архив.
+    Вызывается при смене недели.
+    """
+    text = await archive_weekly_stats(week_start, contributions)
+    if not text:
+        return False
+
+    try:
+        msg = await bot.send_message(
+            chat_id=REQUIRED_TG_GROUP_ID,
+            text=text,
+            parse_mode="HTML",
+            message_thread_id=GROUP_CARD_TOPIC_ID,
+            disable_web_page_preview=True,
+        )
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                UPDATE weekly_contributions_archive
+                SET tg_message_id = ?
+                WHERE week_start = ?
+            """, (msg.message_id, week_start))
+            await db.commit()
+
+        logger.info(f"[Weekly archive] Итоговое сообщение за {week_start} отправлено")
+        return True
+
+    except TelegramError as e:
+        logger.error(f"[Weekly archive] Ошибка отправки итогов: {e}")
+        return False
+
+
+async def get_weekly_archive() -> List[Dict]:
+    """Возвращает список архивированных недель."""
+    await ensure_weekly_tables()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT * FROM weekly_contributions_archive
+            ORDER BY week_start DESC
+        """) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+
+# ══════════════════════════════════════════════════════════════
 # ЗАКРЕПЛЁННОЕ СООБЩЕНИЕ — БД
 # ══════════════════════════════════════════════════════════════
 
@@ -244,7 +367,7 @@ async def clear_pinned_message_info(chat_id: int):
 
 
 # ══════════════════════════════════════════════════════════════
-# ФОРМАТИРОВАНИЕ СООБЩЕНИЯ
+# ФОРМАТИРОВАНИЕ ТЕКУЩЕГО СООБЩЕНИЯ
 # ══════════════════════════════════════════════════════════════
 
 
@@ -269,16 +392,15 @@ def format_weekly_message(contributions: List[Dict], week_start: str) -> str:
             f"Пока никто не сделал вклад."
         )
 
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    lines = []
+    medals  = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines   = []
 
     for i, c in enumerate(contributions, 1):
-        prefix = medals.get(i, f"<b>{i}.</b>")
-        nick   = c["nick"]
-        url    = c.get("profile_url", "")
-        count  = c["contribution"]
-        word   = _plural_contribution(count)
-
+        prefix    = medals.get(i, f"<b>{i}.</b>")
+        nick      = c["nick"]
+        url       = c.get("profile_url", "")
+        count     = c["contribution"]
+        word      = _plural_contribution(count)
         name_part = f'<a href="{url}">{nick}</a>' if url else nick
         lines.append(f"{prefix} {name_part} — {count} {word}")
 

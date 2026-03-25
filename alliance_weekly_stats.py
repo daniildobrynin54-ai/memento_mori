@@ -79,6 +79,19 @@ async def ensure_alliance_weekly_tables():
                 updated_at  TEXT NOT NULL
             )
         """)
+        # ── Архив завершённых недель ─────────────────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS alliance_weekly_archive (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                week_start          TEXT NOT NULL UNIQUE,
+                week_end            TEXT NOT NULL,
+                message_text        TEXT NOT NULL,
+                total_delta         INTEGER NOT NULL DEFAULT 0,
+                participants_count  INTEGER NOT NULL DEFAULT 0,
+                archived_at         TEXT NOT NULL,
+                tg_message_id       INTEGER
+            )
+        """)
         await db.commit()
 
 
@@ -139,7 +152,7 @@ def compute_alliance_hash(contributions: List[Dict]) -> str:
 
 
 # ══════════════════════════════════════════════════════════════
-# РАБОТА С БД
+# РАБОТА С БД — ТЕКУЩАЯ НЕДЕЛЯ
 # ══════════════════════════════════════════════════════════════
 
 
@@ -178,6 +191,7 @@ async def upsert_alliance_contributions(
     async with aiosqlite.connect(DB_PATH) as db:
         for c in contributions:
             if is_new_week:
+                # Новая неделя: baseline = текущее значение (прирост начинается с 0)
                 await db.execute("""
                     INSERT INTO alliance_club_contributions
                         (week_start, mangabuff_id, nick, profile_url,
@@ -193,6 +207,7 @@ async def upsert_alliance_contributions(
                     c["contribution"], c["contribution"], updated_at,
                 ))
             else:
+                # Обновление текущей недели: baseline НЕ трогаем
                 await db.execute("""
                     INSERT INTO alliance_club_contributions
                         (week_start, mangabuff_id, nick, profile_url,
@@ -207,6 +222,125 @@ async def upsert_alliance_contributions(
                     c["contribution"], c["contribution"], updated_at,
                 ))
         await db.commit()
+
+
+# ══════════════════════════════════════════════════════════════
+# АРХИВ НЕДЕЛЬ
+# ══════════════════════════════════════════════════════════════
+
+
+async def get_alliance_archive_weeks() -> List[Dict]:
+    """Возвращает список архивированных недель."""
+    await ensure_alliance_weekly_tables()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT * FROM alliance_weekly_archive
+            ORDER BY week_start DESC
+        """) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+
+async def archive_alliance_week(week_start: str, rows: List[Dict]) -> Optional[str]:
+    """
+    Сохраняет итоги недели в архив.
+    Возвращает текст итогового сообщения или None если нечего архивировать.
+    """
+    await ensure_alliance_weekly_tables()
+
+    active_rows = [r for r in rows if r["contribution_current"] - r["contribution_baseline"] > 0]
+    if not active_rows:
+        logger.info(f"[Alliance archive] Неделя {week_start}: нет активных вкладчиков, пропускаем")
+        return None
+
+    active_rows.sort(
+        key=lambda r: r["contribution_current"] - r["contribution_baseline"],
+        reverse=True
+    )
+
+    total_delta = sum(r["contribution_current"] - r["contribution_baseline"] for r in rows)
+    week_end    = get_alliance_week_end(week_start)
+    date_range  = format_alliance_week_range(week_start)
+
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines  = [f"🏆 <b>Итоги вкладов в альянс</b> ({date_range})\n"]
+
+    for i, r in enumerate(active_rows, 1):
+        url   = r.get("profile_url", "")
+        nick  = r["nick"]
+        base  = r["contribution_baseline"]
+        curr  = r["contribution_current"]
+        delta = curr - base
+        name  = f'<a href="{url}">{nick}</a>' if url else nick
+        lines.append(f"{medals.get(i, f'{i}.')} {name} — +{delta} ({base}→{curr})")
+
+    lines.append(f"\n👥 Вкладчиков: {len(active_rows)}")
+    lines.append(f"📈 Общий прирост за неделю: <b>+{total_delta}</b>")
+    lines.append(f"\n📦 Данные сохранены в архив.")
+
+    text = "\n".join(lines)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO alliance_weekly_archive
+                (week_start, week_end, message_text, total_delta,
+                 participants_count, archived_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(week_start) DO UPDATE SET
+                message_text       = excluded.message_text,
+                total_delta        = excluded.total_delta,
+                participants_count = excluded.participants_count,
+                archived_at        = excluded.archived_at
+        """, (
+            week_start, week_end, text, total_delta,
+            len(active_rows), ts_for_db(now_msk()),
+        ))
+        await db.commit()
+
+    logger.info(
+        f"[Alliance archive] Неделя {week_start} сохранена: "
+        f"{len(active_rows)} вкладчиков, прирост +{total_delta}"
+    )
+    return text
+
+
+async def send_alliance_week_archive_message(
+    bot: Bot,
+    week_start: str,
+    rows: List[Dict],
+) -> bool:
+    """
+    Отправляет итоговое сообщение в топик и сохраняет в архив.
+    Вызывается при смене недели.
+    """
+    text = await archive_alliance_week(week_start, rows)
+    if not text:
+        return False
+
+    try:
+        msg = await bot.send_message(
+            chat_id=REQUIRED_TG_GROUP_ID,
+            text=text,
+            parse_mode="HTML",
+            message_thread_id=GROUP_ALLIANCE_TOPIC_ID,
+            disable_web_page_preview=True,
+        )
+        # Сохраняем ID сообщения в архиве
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                UPDATE alliance_weekly_archive
+                SET tg_message_id = ?
+                WHERE week_start = ?
+            """, (msg.message_id, week_start))
+            await db.commit()
+
+        logger.info(f"[Alliance archive] Итоговое сообщение за {week_start} отправлено")
+        return True
+
+    except TelegramError as e:
+        logger.error(f"[Alliance archive] Ошибка отправки итогов: {e}")
+        return False
 
 
 # ══════════════════════════════════════════════════════════════
@@ -258,7 +392,7 @@ async def clear_pinned_alliance_message(chat_id: int):
 
 
 # ══════════════════════════════════════════════════════════════
-# ФОРМАТИРОВАНИЕ СООБЩЕНИЯ
+# ФОРМАТИРОВАНИЕ ТЕКУЩЕГО СООБЩЕНИЯ
 # ══════════════════════════════════════════════════════════════
 
 
@@ -267,15 +401,9 @@ def format_alliance_weekly_message(rows: list, week_start: str) -> str:
     Показывает только тех, кто реально вкладывал за неделю (delta > 0),
     отсортированных по приросту по убыванию.
     """
-    from alliance_weekly_stats import format_alliance_week_range
-    from timezone_utils import now_msk
-
     date_range = format_alliance_week_range(week_start)
 
-    # Фильтруем: только те, у кого прирост > 0
     active_rows = [r for r in rows if r["contribution_current"] - r["contribution_baseline"] > 0]
-
-    # Сортируем по приросту по убыванию
     active_rows.sort(key=lambda r: r["contribution_current"] - r["contribution_baseline"], reverse=True)
 
     total_delta = sum(r["contribution_current"] - r["contribution_baseline"] for r in rows)
@@ -291,17 +419,16 @@ def format_alliance_weekly_message(rows: list, week_start: str) -> str:
 
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     medal_lines = []
-    rest_lines = []
+    rest_lines  = []
 
     for i, r in enumerate(active_rows, 1):
-        url = r.get("profile_url", "")
-        nick = r["nick"]
-        base = r["contribution_baseline"]
-        curr = r["contribution_current"]
+        url   = r.get("profile_url", "")
+        nick  = r["nick"]
+        base  = r["contribution_baseline"]
+        curr  = r["contribution_current"]
         delta = curr - base
-        name_part = f'<a href="{url}">{nick}</a>' if url else nick
-
-        line = f"{medals.get(i, f'{i}.')} {name_part} — {base} → <b>{curr}</b> (+{delta})"
+        name  = f'<a href="{url}">{nick}</a>' if url else nick
+        line  = f"{medals.get(i, f'{i}.')} {name} — {base} → <b>{curr}</b> (+{delta})"
 
         if i <= 3:
             medal_lines.append(line)

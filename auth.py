@@ -107,11 +107,6 @@ def login(
 ) -> Optional[RateLimitedSession]:
     """
     Авторизация на mangabuff.ru.
-
-    Форма логина — <div class="form">, без <form> тега.
-    Кнопка 'login-button' отправляет AJAX POST на /login.
-    Поэтому нужно слать как XHR: X-Requested-With + Accept: application/json.
-    Ответ — JSON: {"success": true, ...} или редирект с Set-Cookie.
     """
     session = create_session(proxy_manager)
     raw = session._session
@@ -151,7 +146,6 @@ def login(
 
     print(f"   CSRF: {csrf[:30]}...")
 
-    # XSRF-TOKEN из куки — декодируем для заголовка
     xsrf_raw = _get_cookie(raw.cookies, "XSRF-TOKEN")
     xsrf = unquote(xsrf_raw) if xsrf_raw else csrf
 
@@ -218,6 +212,56 @@ def refresh_session_token(session: RateLimitedSession) -> bool:
         return True
     except Exception as e:
         print(f"❌ Ошибка: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Повторная авторизация (замена внутренней сессии без разрыва ссылок)
+# ---------------------------------------------------------------------------
+
+def relogin(
+    session: RateLimitedSession,
+    email: str,
+    password: str,
+    proxy_manager: Optional[ProxyManager] = None,
+) -> bool:
+    """
+    Полная повторная авторизация.
+
+    Обновляет session._session на месте — все существующие ссылки
+    на объект session продолжают работать с новой куки/токенами.
+
+    Returns:
+        True если авторизация прошла успешно
+    """
+    print("🔄 Повторная авторизация...")
+    new_sess = login(email, password, proxy_manager)
+    if new_sess and isinstance(new_sess, RateLimitedSession):
+        session._session = new_sess._session
+        session._last_request_time = None
+        print("✅ Повторная авторизация успешна")
+        return True
+    print("❌ Повторная авторизация не удалась")
+    return False
+
+
+def is_session_alive(session: RateLimitedSession) -> bool:
+    """
+    Быстрая проверка живости сессии — GET / и смотрим, не ушли ли на /login.
+    """
+    try:
+        raw = session._session if hasattr(session, "_session") else session
+        r = raw.get(BASE_URL, timeout=10, allow_redirects=True)
+        # Если нас отправило на страницу логина — сессия мертва
+        if "/login" in r.url:
+            return False
+        if r.status_code != 200:
+            return False
+        # Дополнительная проверка: на живой сессии нет формы логина в хедере
+        if 'login-button' in r.text and 'mangabuff_session' not in str(raw.cookies):
+            return False
+        return True
+    except Exception:
         return False
 
 

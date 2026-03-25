@@ -5,6 +5,11 @@
 1. Смену текущей манги (как раньше).
 2. Вклады клуба Memento Mori (data-page="club64") с отображением
    прироста за неделю в закреплённом сообщении.
+
+Изменения:
+- При рестарте НЕ сбрасывает baseline (прогресс сохраняется).
+- При смене недели: архивирует старую неделю → отправляет итоги → начинает новую.
+- Восстанавливается после смерти сессии (переавторизация).
 """
 
 import asyncio
@@ -14,7 +19,10 @@ from typing import Optional, Dict, Any
 import requests
 from bs4 import BeautifulSoup
 
-from config import BASE_URL, ALLIANCE_URL, ALLIANCE_CHECK_INTERVAL
+from config import (
+    BASE_URL, ALLIANCE_URL, ALLIANCE_CHECK_INTERVAL,
+    LOGIN_EMAIL, LOGIN_PASSWORD,
+)
 from timezone_utils import ts_for_db, now_msk
 from alliance_weekly_stats import (
     CLUB_PAGE_ATTR,
@@ -24,9 +32,13 @@ from alliance_weekly_stats import (
     get_alliance_week_rows,
     upsert_alliance_contributions,
     send_or_update_alliance_pinned,
+    send_alliance_week_archive_message,
 )
 
 logger = logging.getLogger(__name__)
+
+# Количество подряд идущих ошибок, после которых пробуем переавторизацию
+_RELOGIN_AFTER_FAILURES = 5
 
 
 # ══════════════════════════════════════════════════════════════
@@ -56,6 +68,11 @@ class AllianceParser:
             try:
                 response = self.session.get(ALLIANCE_URL, timeout=15)
 
+                # Детектируем смерть сессии по редиректу на /login
+                if hasattr(response, 'url') and '/login' in str(response.url):
+                    logger.warning("[Alliance] Сессия истекла — редирект на /login")
+                    return None
+
                 if response.status_code == 500:
                     logger.warning(
                         f"[Alliance] HTTP 500 (попытка {attempt + 1}/{self.MAX_RETRIES})"
@@ -63,6 +80,10 @@ class AllianceParser:
                     if attempt < self.MAX_RETRIES - 1:
                         import time; time.sleep(self.RETRY_DELAY)
                     continue
+
+                if response.status_code == 403:
+                    logger.warning("[Alliance] HTTP 403 — сессия вероятно мертва")
+                    return None
 
                 if response.status_code != 200:
                     logger.warning(
@@ -72,6 +93,11 @@ class AllianceParser:
                     if attempt < self.MAX_RETRIES - 1:
                         import time; time.sleep(self.RETRY_DELAY)
                     continue
+
+                # Проверяем, не пришла ли страница логина вместо альянса
+                if 'login-button' in response.text and 'alliance' not in response.url:
+                    logger.warning("[Alliance] Получена страница логина вместо альянса")
+                    return None
 
                 return response.text
 
@@ -101,14 +127,12 @@ class AllianceParser:
         try:
             soup = BeautifulSoup(html, "html.parser")
 
-            # Вариант 1: ссылка card-show__placeholder
             manga_link = soup.find("a", class_="card-show__placeholder")
             if manga_link:
                 href = manga_link.get("href", "")
                 if href.startswith("/manga/"):
                     return href.replace("/manga/", "")
 
-            # Вариант 2: background-image в card-show__header
             poster = soup.find("div", class_="card-show__header")
             if poster:
                 style = poster.get("style", "")
@@ -141,7 +165,6 @@ class AllianceParser:
 
                 soup = BeautifulSoup(response.text, "html.parser")
 
-                # Название
                 title = None
                 for cls in ("manga-mobile__name", "manga__name"):
                     elem = soup.find("h1", class_=cls)
@@ -151,7 +174,6 @@ class AllianceParser:
                 if not title:
                     title = manga_slug
 
-                # Изображение
                 img_src = None
                 img_elem = soup.find("img", class_="manga-mobile__image")
                 if img_elem:
@@ -186,11 +208,37 @@ class AllianceParser:
 
 
 # ══════════════════════════════════════════════════════════════
+# ПЕРЕАВТОРИЗАЦИЯ
+# ══════════════════════════════════════════════════════════════
+
+
+async def _try_relogin(session, loop) -> bool:
+    """Пытается переавторизоваться, возвращает True при успехе."""
+    from auth import relogin
+    from proxy_manager import ProxyManager
+
+    logger.warning("[Alliance] Попытка переавторизации...")
+    try:
+        result = await loop.run_in_executor(
+            None,
+            lambda: relogin(session, LOGIN_EMAIL, LOGIN_PASSWORD, ProxyManager(enabled=False))
+        )
+        if result:
+            logger.info("[Alliance] ✅ Переавторизация прошла успешно")
+        else:
+            logger.error("[Alliance] ❌ Переавторизация не удалась")
+        return result
+    except Exception as e:
+        logger.error(f"[Alliance] Ошибка переавторизации: {e}", exc_info=True)
+        return False
+
+
+# ══════════════════════════════════════════════════════════════
 # ОСНОВНОЙ ЦИКЛ МОНИТОРИНГА
 # ══════════════════════════════════════════════════════════════
 
 
-async def alliance_monitor_loop(session: requests.Session, bot):
+async def alliance_monitor_loop(session, bot):
     """
     Фоновый цикл мониторинга альянса.
 
@@ -199,9 +247,12 @@ async def alliance_monitor_loop(session: requests.Session, bot):
     2. Мониторинг вкладов клуба (data-page="club64") →
        закреплённое сообщение с приростом за неделю.
 
-    Args:
-        session: авторизованная сессия requests
-        bot:     экземпляр Telegram бота
+    При смене недели:
+    - Архивирует старую неделю (отправляет итоговое сообщение).
+    - Начинает новую неделю с текущих значений как baseline.
+
+    При рестарте:
+    - НЕ сбрасывает baseline если данные за эту неделю уже есть в БД.
     """
     from database import get_current_alliance_manga, save_alliance_manga
     from notifier import notify_alliance_manga_changed
@@ -213,14 +264,12 @@ async def alliance_monitor_loop(session: requests.Session, bot):
 
     # ── Стартовое состояние ──────────────────────────────────
 
-    # Загружаем страницу один раз при старте
     start_html = await loop.run_in_executor(None, parser.fetch_page)
 
     current_slug: Optional[str] = None
     if start_html:
         current_slug = parser.get_current_manga_slug(start_html)
 
-    # Восстанавливаем slug манги из БД
     saved = await get_current_alliance_manga()
 
     if saved is None and current_slug and start_html:
@@ -239,23 +288,38 @@ async def alliance_monitor_loop(session: requests.Session, bot):
 
     last_club_hash:  Optional[str] = None
     last_week_start: str           = get_alliance_week_start()
-    is_initialized:  bool          = False   # флаг первого успешного снимка
+    consecutive_failures: int      = 0
 
-    # Стартовая инициализация вкладов из первой загрузки
+    # ── Инициализация вкладов при старте ────────────────────
+    #
+    # КЛЮЧЕВОЕ ОТЛИЧИЕ от предыдущей версии:
+    # Если данные за эту неделю УЖЕ ЕСТЬ в БД — используем is_new_week=False,
+    # чтобы не перезаписать baseline (не сбросить накопленный прогресс).
+    # is_new_week=True ставим только если данных нет вообще.
+
     if start_html:
         contributions = parse_alliance_club_contributions(start_html)
         if contributions:
+            existing_rows = await get_alliance_week_rows(last_week_start)
+            is_fresh_week = len(existing_rows) == 0
+
             await upsert_alliance_contributions(
-                last_week_start, contributions, is_new_week=True
+                last_week_start, contributions, is_new_week=is_fresh_week
             )
             rows = await get_alliance_week_rows(last_week_start)
             await send_or_update_alliance_pinned(bot, rows, last_week_start)
             last_club_hash = compute_alliance_hash(contributions)
-            is_initialized = True
-            logger.info(
-                f"🚀 Старт мониторинга вкладов клуба: "
-                f"{len(contributions)} участников, неделя {last_week_start}"
-            )
+
+            if is_fresh_week:
+                logger.info(
+                    f"🚀 Старт: новая неделя {last_week_start}, "
+                    f"baseline установлен ({len(contributions)} участников)"
+                )
+            else:
+                logger.info(
+                    f"🚀 Старт: восстановление недели {last_week_start}, "
+                    f"baseline сохранён ({len(existing_rows)} участников в БД)"
+                )
 
     # ── Основной цикл ─────────────────────────────────────────
 
@@ -267,12 +331,28 @@ async def alliance_monitor_loop(session: requests.Session, bot):
             check_count += 1
 
             html = await loop.run_in_executor(None, parser.fetch_page)
+
             if not html:
-                if check_count % 60 == 0:
-                    logger.warning("[Alliance] Не удалось загрузить страницу")
+                consecutive_failures += 1
+                if check_count % 10 == 0:
+                    logger.warning(
+                        f"[Alliance] Не удалось загрузить страницу "
+                        f"(подряд: {consecutive_failures})"
+                    )
+
+                # Пробуем переавторизацию после N неудач
+                if consecutive_failures >= _RELOGIN_AFTER_FAILURES:
+                    ok = await _try_relogin(session, loop)
+                    if ok:
+                        consecutive_failures = 0
+                    else:
+                        # Ждём дольше перед следующей попыткой
+                        await asyncio.sleep(60)
                 continue
 
-            current_week_start = get_alliance_week_start()
+            # Успешная загрузка — сбрасываем счётчик ошибок
+            consecutive_failures = 0
+            current_week_start   = get_alliance_week_start()
 
             # ══════════════════════════════════════════════════
             # СМЕНА МАНГИ
@@ -308,33 +388,37 @@ async def alliance_monitor_loop(session: requests.Session, bot):
 
             current_hash = compute_alliance_hash(contributions)
 
-            # Смена недели
+            # ── Смена недели ─────────────────────────────────
             if current_week_start != last_week_start:
                 logger.info(
-                    f"[Alliance] Новая неделя: "
+                    f"[Alliance] 📅 Смена недели: "
                     f"{last_week_start} → {current_week_start}"
                 )
-                # Сохраняем текущие значения как baseline новой недели
+
+                # 1. Архивируем итоги старой недели
+                old_rows = await get_alliance_week_rows(last_week_start)
+                if old_rows:
+                    await send_alliance_week_archive_message(bot, last_week_start, old_rows)
+                    logger.info(f"[Alliance] Итоги недели {last_week_start} отправлены")
+
+                # 2. Начинаем новую неделю: baseline = текущие значения
                 await upsert_alliance_contributions(
                     current_week_start, contributions, is_new_week=True
                 )
                 last_week_start = current_week_start
-                last_club_hash  = None   # Сбрасываем для гарантированного обновления
+                last_club_hash  = None   # гарантируем обновление закреплённого
 
-            # Данные изменились
+            # ── Данные изменились ────────────────────────────
             if current_hash != last_club_hash:
-                is_new = not is_initialized or current_week_start != last_week_start
                 await upsert_alliance_contributions(
                     current_week_start,
                     contributions,
-                    is_new_week=is_new,
+                    is_new_week=False,  # baseline уже установлен — не трогаем
                 )
                 rows = await get_alliance_week_rows(current_week_start)
                 await send_or_update_alliance_pinned(bot, rows, current_week_start)
                 last_club_hash = current_hash
-                is_initialized = True
 
-                # Находим топ-прироста для лога
                 top = max(
                     rows,
                     key=lambda r: r["contribution_current"] - r["contribution_baseline"],
